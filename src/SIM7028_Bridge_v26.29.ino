@@ -10,6 +10,73 @@
  *   UART2    (Serial2)  = Ext. µC  RX:G39 TX:G38    9600
  *
  * Version History:
+ *   v26.32 (2026-11-18) – Netzwechsel robust, Diagnose-Log mit Uhrzeit
+ *     FIX 51 – Netzzeit: SIM7028 liefert +CCLK mit 4-stelligem Jahr
+ *       ("2026/11/18,...") - wurde bisher verworfen. Jetzt hat jeder
+ *       Log-Eintrag Datum + Uhrzeit (Ortszeit laut Netz).
+ *     FIX 52 – Modem abschalten: AT+CPOWD=1 liefert beim SIM7028 ERROR
+ *       (Modem blieb an). Jetzt: CPOWD, sonst Power-Key-Puls 2,5s, danach
+ *       Pruefung per AT ob das Modem wirklich aus ist; sonst AT+CFUN=1,1
+ *       (Modem-Reset), notfalls AT+CFUN=0. Ergebnis wird geloggt.
+ *     FIX 53 – Netzverlust aktiv erkennen (Mobilfunk-Umstellungen):
+ *       - +CEREG-URC "nicht registriert" -> sofort neu anmelden (COPS=0)
+ *       - alle 5 Min im Leerlauf AT+CEREG? (falls URC verloren ging)
+ *       - Anmeldung, die nicht laeuft (z.B. nach NONET), startet im
+ *         Leerlauf selbst, nicht erst beim naechsten µC-Abruf
+ *       - je 30 Min ohne Netz -> naechste Stufe (min. 2: Funkteil neu,
+ *         dann Modem neu, dann Komplett-Neustart). Ersetzt den
+ *         GAVE_UP-Sonderfall (Anmeldung bleibt nie dauerhaft aufgegeben).
+ *     FIX 54 – Diagnose-Log:
+ *       - stuendliches Lebenszeichen: HTTP ok/fehl, µC-Befehle + Bytes,
+ *         µC still seit, Netzstatus, CSQ, Heap
+ *       - µC 15 Min ohne Befehl -> WARN mit letztem Befehl und ob noch
+ *         Bytes ankommen (µC haengt vs. Leitung gestoert); Wieder-
+ *         aufnahme wird ebenfalls geloggt
+ *       - AT+HTTPPARA="CID" entfernt (SIM7028: immer ERROR, 96% des Logs)
+ *       - harmlose Startfehler (AT+CPIN?, AT+CRSM) nicht mehr geloggt
+ *
+ *   v26.31 (2026-11-18) – Stoerungserkennung + gestufte Wiederherstellung
+ *     FIX 50 – Statt fest getaktetem Neustart: Stoerungen erkennen und
+ *       gestuft eingreifen (alle Schwellwerte als Konstanten oben):
+ *       Erkennung Verbindung: HTTP-Status 0 oder 6xx (Modem-/Netzfehler)
+ *         zaehlt als Verbindungsfehler; jeder HTTP-Status 100-599 (Server
+ *         erreicht) setzt alles zurueck. 3 Fehler in Folge -> naechste Stufe.
+ *         3h ohne Erfolg trotz Versuchen -> direkt Stufe 4.
+ *       Stufen (nur wenn der µC 15s still ist, sonst max. 10 Min warten):
+ *         1 Verbindung neu: HTTPTERM, Registrierung + IP pruefen, ggf. neu
+ *         2 Funkteil neu:   AT+CFUN=0 / AT+CFUN=1, Neuanmeldung
+ *         3 Modem neu:      Modem aus/ein, ATOM laeuft weiter
+ *         4 Komplett neu:   ATOM + Modem (60s Deep Sleep)
+ *       Registrierung aufgegeben (GAVE_UP) -> nach 60 Min Stufe 3.
+ *       Modem stumm: wird es 60s still, wird alle 20s "AT" geschickt;
+ *         3 Fehlversuche -> Komplett-Neustart (vorher erst nach 5 Min).
+ *       Modem-Selbstneustart (URC "RDY" / "+CPIN: READY") wird erkannt,
+ *         Modem wird neu eingerichtet (ATE0, kein Sleep, APN, Anmeldung).
+ *       Speicher: freier Heap < 40 KB oder groesster Block < 16 KB ->
+ *         geplanter Komplett-Neustart.
+ *       Task-Watchdog 120s statt 300s.
+ *       Schleifenschutz: 3 Stoerungs-Neustarts in Folge ohne erfolgreiche
+ *         Verbindung -> 30 Min Pause statt 60s (schont 1NCE No-Harm).
+ *       Zyklischer Neustart nur noch als Sicherheitsnetz alle 24h
+ *         (max. 2h verschieben).
+ *       USB: STATUS (Zustand), REC1/REC2/REC3 (Stufe zum Testen ausloesen).
+ *
+ *   v26.30 (2026-11-18) – Zyklischer Neustart alle 2h + Haenger-Neustart komplett
+ *     FIX 49 – Zyklischer Neustart von ATOM + SIM7028 jetzt alle 2h
+ *       Betriebszeit (vorher 24h). Verschieben, solange der µC aktiv ist,
+ *       max. 30 Min (vorher 2h), dann erzwungen.
+ *       Haenger-Neustart (Modem 5 Min stumm, USB "RESTART") laeuft jetzt
+ *       ueber denselben kompletten Ablauf wie der zyklische Neustart:
+ *       Modem aus, ATOM 60s Deep Sleep, Kaltstart von ATOM + Modem
+ *       (vorher nur ESP.restart(), Modem blieb an).
+ *       Antwortet das Modem nicht mehr auf AT, wird es per langem
+ *       Power-Key-Puls (2,5s) ausgeschaltet statt per AT+CPOWD=1.
+ *       Nach einem Watchdog-/Panic-Reset (Task-WDT, Crash) wird beim Boot
+ *       ebenfalls der komplette Ablauf ausgefuehrt, damit auch das Modem
+ *       neu startet.
+ *       Boot-Meldung zeigt die Art des letzten Neustarts (zyklisch/Haenger).
+ *       USB "DAILY" heisst jetzt "CYCLE" (DAILY funktioniert weiterhin).
+ *
  *   v26.29 (2026-11-09) – Nichtfluechtiges Fehler-Log im Flash
  *     FIX 48 – Fehler und wichtige Ereignisse werden in LittleFS
  *       (/errlog.txt, max. 64 KB, danach Rotation nach /errlog_old.txt)
@@ -99,8 +166,8 @@
 #include <Preferences.h>  // FIX 48: Boot-Zaehler im NVS
 #include <time.h>
 
-#define FW_VERSION  "v26.29"
-#define FW_DATE     "2026-11-09"
+#define FW_VERSION  "v26.32"
+#define FW_DATE     "2026-11-18"
 
 // ── Pins ──────────────────────────────────────────────────────────────────────
 #define SIM_TX_PIN    5
@@ -124,16 +191,38 @@ Adafruit_NeoPixel led(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 // ── PDP-Kontext (FIX 17: SIM7028 nutzt Kontext 0 für die IP) ──────────────────
 #define PDP_CID  0
 
-// ── FIX 46: Haenger-Ueberwachung ──────────────────────────────────────────────
-#define HANG_RESTART_S           300U        // 5 Minuten
-#define HANG_RESTART_MS          (HANG_RESTART_S * 1000UL)
-#define MODEM_HEALTH_INTERVAL_MS 60000UL     // Leerlauf-Pruefung alle 60s
+// ── FIX 46/50: Haenger-Ueberwachung ───────────────────────────────────────────
+#define WDT_TIMEOUT_S            120U        // Task-Watchdog: ATOM haengt 2 Min
+#define MODEM_SILENT_PING_MS     60000UL     // Modem 60s still -> "AT" schicken
+#define MODEM_PING_INTERVAL_MS   20000UL     // danach alle 20s erneut
+#define MODEM_PING_FAIL_MAX      3U          // 3x keine Antwort -> Komplett-Neustart
 
-// ── FIX 47: Taeglicher Neustart ───────────────────────────────────────────────
-#define DAILY_RESTART_MS        (24UL * 3600UL * 1000UL) // alle 24h Betriebszeit
-#define DAILY_RESTART_OFF_S     60ULL                    // 1 Min Pause (aus)
-#define DAILY_RESTART_IDLE_MS   120000UL                 // µC mind. 2 Min still
-#define DAILY_RESTART_MAX_DELAY_MS (2UL * 3600UL * 1000UL) // max. 2h verschieben
+// ── FIX 50: Verbindungsueberwachung + gestufte Wiederherstellung ─────────────
+#define CONN_FAIL_THRESHOLD      3U                         // Fehler in Folge je Stufe
+#define CONN_NO_SUCCESS_MAX_MS   (3UL * 3600UL * 1000UL)    // 3h ohne Erfolg -> Stufe 4
+#define RECOVERY_IDLE_MS         15000UL                    // µC mind. 15s still
+#define RECOVERY_MAX_DELAY_MS    (10UL * 60UL * 1000UL)     // max. 10 Min warten
+#define NOREG_ESCALATE_MS        (30UL * 60UL * 1000UL)     // je 30 Min ohne Netz -> naechste Stufe
+#define REG_CHECK_INTERVAL_MS    (5UL * 60UL * 1000UL)      // FIX 53: Leerlauf-Pruefung CEREG
+#define LOG_HEARTBEAT_MS         (60UL * 60UL * 1000UL)     // FIX 54: Lebenszeichen ins Log
+#define EXT_UC_SILENT_WARN_MS    (15UL * 60UL * 1000UL)     // FIX 54: µC still -> WARN
+#define MODEM_REBOOT_GUARD_MS    60000UL                    // eigene Modem-Aktion: URCs ignorieren
+#define RESTART_LOOP_MAX         3U                         // Stoerungs-Neustarts in Folge
+#define RESTART_LOOP_OFF_S       (30ULL * 60ULL)            // dann 30 Min Pause
+#define HEAP_MIN_FREE            40000UL                    // freier Heap
+#define HEAP_MIN_BLOCK           16000UL                    // groesster freier Block
+#define HEAP_CHECK_INTERVAL_MS   60000UL
+
+// ── FIX 47/49/50: Zyklischer Neustart ATOM + SIM7028 (Sicherheitsnetz) ────────
+#define CYCLE_RESTART_MS        (24UL * 3600UL * 1000UL) // alle 24h Betriebszeit
+#define CYCLE_RESTART_OFF_S     60ULL                    // 1 Min Pause (aus)
+#define CYCLE_RESTART_IDLE_MS   120000UL                 // µC mind. 2 Min still
+#define CYCLE_RESTART_MAX_DELAY_MS (2UL * 3600UL * 1000UL) // max. 2h verschieben
+#define MODEM_PWRKEY_OFF_MS     2500U                    // FIX 49: langer Puls = Modem aus
+
+// Art des Neustarts (ueberlebt Deep Sleep, fuer die Boot-Meldung)
+#define RESTART_KIND_CYCLE  1
+#define RESTART_KIND_HANG   2
 
 // ── DE-Netzbetreiber für Fallback (FIX 18) ────────────────────────────────────
 struct Operator { const char *plmn; const char *name; };
@@ -207,10 +296,38 @@ static int  rawHttpReadLen = 0;
 // FIX 46: Zeitpunkt der letzten gueltigen Modem-Antwort / URC
 static uint32_t lastModemAliveMs = 0;
 
-// FIX 47: letzter Befehl vom ext. µC + Neustart-Zaehler (ueberlebt Deep Sleep)
+// FIX 47/49: letzter Befehl vom ext. µC + Neustart-Zaehler (ueberlebt Deep Sleep)
 static uint32_t lastExtCmdMs = 0;
-RTC_DATA_ATTR static uint32_t dailyRestartCount = 0;
-static void dailyRestart(const char *reason);   // Vorwaertsdeklaration
+RTC_DATA_ATTR static uint32_t fullRestartCount = 0;
+RTC_DATA_ATTR static uint8_t  lastRestartKind  = 0;
+RTC_DATA_ATTR static uint32_t lastRestartOffS  = 0;
+static void fullRestart(uint8_t kind, const char *reason);   // Vorwaertsdeklaration
+
+// FIX 50: Verbindungsueberwachung / gestufte Wiederherstellung
+static uint8_t  connFails = 0;            // Verbindungsfehler in Folge
+static uint8_t  recoveryLevel = 0;        // zuletzt ausgefuehrte Stufe (0 = keine)
+static uint8_t  recoveryPending = 0;      // geplante Stufe (0 = keine)
+static uint32_t recoveryPendingSince = 0;
+static char     recoveryReason[64] = "";
+static uint32_t lastConnOkMs = 0;         // letzte erfolgreiche Verbindung
+static uint32_t firstFailSinceOkMs = 0;   // erster Fehler seit letztem Erfolg (0 = keiner)
+static bool     connOkSinceBoot = false;
+static uint32_t modemActionMs = 0;        // letzte eigene Modem-Aktion (Init/CFUN/Power)
+static bool     modemRebootDetected = false;
+static uint8_t  modemPingFails = 0;
+static uint32_t heapLowSinceMs = 0;
+static uint32_t noRegSinceMs = 0;         // FIX 53: seit wann kein Netz (0 = registriert)
+static uint32_t regLostAtMs = 0;          // FIX 53: Zeitpunkt Netzverlust (Gnadenfrist)
+#define REG_LOST_GRACE_MS        60000UL
+// FIX 54: µC-Aktivitaet
+static uint32_t extCmdCount = 0;          // Befehle vom µC gesamt
+static uint32_t extRxBytes = 0;           // Bytes vom µC gesamt
+static uint32_t extRxBytesAtLastCmd = 0;
+static char     lastExtCmdText[48] = "-";
+static bool     extSilentWarned = false;
+RTC_DATA_ATTR static uint8_t failedRestartsInRow = 0;
+static void runRecoveryStage(uint8_t level, const char *reason);   // Vorwaertsdeklaration
+static void printRecoveryStatus();                                 // Vorwaertsdeklaration
 
 // ══════════════════════════════════════════════════════════════════════════════
 // FIX 48: Nichtfluechtiges Fehler-Log (LittleFS) + Netzzeit
@@ -350,7 +467,9 @@ static void logClear() {
 // AT-Fehler loggen – erwartete/harmlose Befehle auslassen
 static bool atLogSuppressed(const char *cmd) {
     return strcmp(cmd, "AT") == 0 ||                 // Boot-/Health-Ping (eigener Eintrag)
-           strncmp(cmd, "AT+CRSM=214", 11) == 0 ||   // FPLMN-Schreiben oft verweigert
+           strncmp(cmd, "AT+CRSM", 7) == 0 ||        // FPLMN lesen/schreiben oft verweigert
+           strcmp(cmd, "AT+CPIN?") == 0 ||           // FIX 54: "SIM busy" beim Start
+                                                     //   (eigener WARN, wenn SIM nie bereit)
            strncmp(cmd, "AT+CSCLK", 8) == 0 ||
            strncmp(cmd, "AT+CPSMS", 8) == 0 ||
            strncmp(cmd, "AT+CEDRXS", 9) == 0;
@@ -370,7 +489,7 @@ static inline void wdtYield() {
 static void wdtInit() {
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
     esp_task_wdt_config_t cfg = {
-        .timeout_ms     = HANG_RESTART_MS,
+        .timeout_ms     = WDT_TIMEOUT_S * 1000UL,
         .idle_core_mask = 0,          // Idle-Tasks nicht ueberwachen
         .trigger_panic  = true,       // Timeout -> Reset
     };
@@ -378,20 +497,18 @@ static void wdtInit() {
         esp_task_wdt_init(&cfg);
     }
 #else
-    esp_task_wdt_init(HANG_RESTART_S, true);   // IDF 4.x: init bzw. update
+    esp_task_wdt_init(WDT_TIMEOUT_S, true);    // IDF 4.x: init bzw. update
 #endif
     esp_task_wdt_add(NULL);                     // loop()-Task ueberwachen
 }
 
+// FIX 49: Haenger-Neustart = kompletter Neustart von ATOM + Modem
 static void hangRestart(const char *reason) {
     Serial.print("\n["); Serial.print(millis()); Serial.print("] [HANG] ");
     Serial.print(reason);
-    Serial.println(" -> Neustart der Bridge (ESP.restart)");
-    logEvent("ERR", "Haenger-Neustart: %s", reason);   // FIX 48
-    Serial.flush();
+    Serial.println(" -> kompletter Neustart ATOM + SIM7028");
     led.setPixelColor(0, led.Color(80,0,0)); led.show();
-    delay(500);
-    ESP.restart();
+    fullRestart(RESTART_KIND_HANG, reason);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -993,8 +1110,8 @@ static void pollRegistrationBackground(uint32_t callerBudgetMs = 0xFFFFFFFFUL) {
             logEvent("ERR", "Modem haengt: %u x keine Antwort auf AT+CEREG?", REG_STUCK_THRESHOLD);
         if (regConsecutiveFails >= REG_STUCK_THRESHOLD) {
             ts(); Serial.println("[NETREG-BG] ⚠ MODEM HAENGT FEST - serieller Port "
-                                  "antwortet nicht. FIX 46: Neustart erfolgt "
-                                  "automatisch, wenn das Modem 5 Min stumm bleibt.");
+                                  "antwortet nicht. FIX 50: Neustart erfolgt "
+                                  "automatisch nach 3 fehlgeschlagenen AT-Pings.");
             regConsecutiveFails = REG_STUCK_THRESHOLD;
         }
     }
@@ -1062,9 +1179,8 @@ static int sim7028HttpGet(const char *fullUrl) {
     }
     httpInitDone=true;
 
-    char cidCmd[32];
-    snprintf(cidCmd, sizeof(cidCmd), "AT+HTTPPARA=\"CID\",%d", PDP_CID);
-    sendAT(cidCmd, "OK", T_SHORT);
+    // FIX 54: AT+HTTPPARA="CID" entfernt - SIM7028 antwortet immer ERROR,
+    // HTTP nutzt ohnehin den Standardkontext.
 
     char urlCmd[800];
     snprintf(urlCmd,sizeof(urlCmd),"AT+HTTPPARA=\"URL\",\"%s\"",fullUrl);
@@ -1277,6 +1393,52 @@ static void handleCsq() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// FIX 50: Verbindungsueberwachung (Erfolg/Fehler zaehlen, Stufe planen)
+// ══════════════════════════════════════════════════════════════════════════════
+static void scheduleRecovery(uint8_t level, const char *reason) {
+    if (level > 4) level = 4;
+    if (recoveryPending >= level) return;          // gleich/hoeher schon geplant
+    recoveryPending = level;
+    recoveryPendingSince = millis();
+    snprintf(recoveryReason, sizeof(recoveryReason), "%s", reason);
+    logEvent("WARN", "Stoerung erkannt (%s) -> Stufe %u geplant", reason, level);
+}
+
+static void noteConnSuccess() {
+    if (recoveryLevel > 0 || connFails > 0 || recoveryPending > 0) {
+        logEvent("INFO", "Verbindung wieder ok (Stufe %u, %u Fehler in Folge)",
+                 recoveryLevel, connFails);
+    }
+    connFails = 0;
+    recoveryLevel = 0;
+    recoveryPending = 0;
+    firstFailSinceOkMs = 0;
+    lastConnOkMs = millis();
+    connOkSinceBoot = true;
+    failedRestartsInRow = 0;
+}
+
+static void noteConnFailure(int status) {
+    connFails++;
+    if (firstFailSinceOkMs == 0) firstFailSinceOkMs = millis();
+    ts(); Serial.print("[RECOVERY] Verbindungsfehler status="); Serial.print(status);
+    Serial.print(" ("); Serial.print(connFails); Serial.print("/");
+    Serial.print(CONN_FAIL_THRESHOLD); Serial.print(" in Folge, Stufe bisher ");
+    Serial.print(recoveryLevel); Serial.println(")");
+
+    if (millis() - firstFailSinceOkMs > CONN_NO_SUCCESS_MAX_MS) {
+        scheduleRecovery(4, "3h ohne erfolgreiche Verbindung");
+        connFails = 0;
+    } else if (connFails >= CONN_FAIL_THRESHOLD) {
+        char why[48];
+        snprintf(why, sizeof(why), "%u HTTP-Fehler in Folge, zuletzt %d",
+                 (unsigned)connFails, status);
+        scheduleRecovery(recoveryLevel + 1, why);
+        connFails = 0;
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // Befehlsverarbeitung vom µC
 // ══════════════════════════════════════════════════════════════════════════════
 static bool isAtCommand(const String &l) {
@@ -1288,7 +1450,16 @@ static bool isAtCommand(const String &l) {
 static void handleExtCommand(const String &rawCmd) {
     String cmd=rawCmd; cmd.trim();
     if (cmd.length()==0) return;
-    lastExtCmdMs = millis();   // FIX 47: µC aktiv -> taeglichen Neustart aufschieben
+    // FIX 54: µC wieder aktiv nach langer Stille?
+    if (extSilentWarned) {
+        logEvent("INFO", "µC wieder aktiv nach %lu Min Stille (Befehl: %.30s)",
+                 (unsigned long)((millis() - lastExtCmdMs)/60000UL), cmd.c_str());
+        extSilentWarned = false;
+    }
+    lastExtCmdMs = millis();   // FIX 47: µC aktiv -> zyklischen Neustart aufschieben
+    extCmdCount++;
+    extRxBytesAtLastCmd = extRxBytes;
+    snprintf(lastExtCmdText, sizeof(lastExtCmdText), "%s", cmd.c_str());
     if (!isAtCommand(cmd)) {
         ts(); Serial.print("[IGN] ");
         for (int i=0;i<min((int)cmd.length(),40);i++) { char c=cmd[i]; Serial.print((c>=32&&c<127)?c:'?'); }
@@ -1408,6 +1579,10 @@ static void handleExtCommand(const String &rawCmd) {
             extSendFailURC(status);
             flashRed();
         }
+        // FIX 50: Server erreicht (100-599) = Verbindung ok, auch bei 4xx/5xx.
+        // 0 oder 6xx = Modem-/Netzfehler.
+        if (status >= 100 && status <= 599) noteConnSuccess();
+        else                                noteConnFailure(status);
         return;
     }
 
@@ -1500,6 +1675,7 @@ static String extCmdBuf;
 static void readExtSerial() {
     while (extSerial.available()) {
         char c=(char)extSerial.read();
+        extRxBytes++;   // FIX 54
         if (c=='\n') {
             if (extCmdBuf.length()>0) { handleExtCommand(extCmdBuf); extCmdBuf=""; }
         } else if (c!='\r') {
@@ -1529,7 +1705,13 @@ static void readUsbSerial() {
                 else if (usbCmdBuf.equalsIgnoreCase("DIAG"))  bootDiag();
                 else if (usbCmdBuf.equalsIgnoreCase("SCAN"))  sendAT("AT+COPS=?","OK",180000);
                 else if (usbCmdBuf.equalsIgnoreCase("RESTART")) hangRestart("manueller RESTART via USB");
-                else if (usbCmdBuf.equalsIgnoreCase("DAILY"))   dailyRestart("manuell via USB (Test)");
+                else if (usbCmdBuf.equalsIgnoreCase("CYCLE") ||
+                         usbCmdBuf.equalsIgnoreCase("DAILY"))
+                    fullRestart(RESTART_KIND_CYCLE, "manuell via USB (Test)");
+                else if (usbCmdBuf.equalsIgnoreCase("STATUS"))  printRecoveryStatus();
+                else if (usbCmdBuf.equalsIgnoreCase("REC1"))    runRecoveryStage(1, "manuell via USB (Test)");
+                else if (usbCmdBuf.equalsIgnoreCase("REC2"))    runRecoveryStage(2, "manuell via USB (Test)");
+                else if (usbCmdBuf.equalsIgnoreCase("REC3"))    runRecoveryStage(3, "manuell via USB (Test)");
                 else if (usbCmdBuf.equalsIgnoreCase("LOG"))     logPrintAll();
                 else if (usbCmdBuf.equalsIgnoreCase("LOGCLR"))  logClear();
                 else if (usbCmdBuf.length()>0)                sendAT(usbCmdBuf.c_str(),"OK",10000);
@@ -1543,53 +1725,136 @@ static void readUsbSerial() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// FIX 46: Modem-Lebenszeichen pruefen (im Leerlauf)
+// Hilfen: Pause mit Watchdog-Fuetterung, Modem abschalten
 // ══════════════════════════════════════════════════════════════════════════════
-static void checkModemAlive() {
-    static uint32_t lastHealthCheck = 0;
-    uint32_t now = millis();
+static void waitMs(uint32_t ms) {
+    uint32_t t0 = millis();
+    while (millis() - t0 < ms) wdtYield();
+}
 
-    // Leerlauf-Ping: nur wenn laenger nichts vom Modem kam
-    if (now - lastModemAliveMs > MODEM_HEALTH_INTERVAL_MS &&
-        now - lastHealthCheck  > MODEM_HEALTH_INTERVAL_MS) {
-        lastHealthCheck = now;
-        if (!sendAT("AT","OK",T_SHORT)) {
-            logEvent("WARN", "Modem antwortet nicht auf AT (stumm seit %lus)",
-                     (unsigned long)((millis() - lastModemAliveMs)/1000UL));
-            ts(); Serial.print("[HEALTH] Modem antwortet nicht (stumm seit ");
-            Serial.print((millis() - lastModemAliveMs)/1000);
-            Serial.print("s, Neustart bei ");
-            Serial.print(HANG_RESTART_S); Serial.println("s)");
+// FIX 49/50/52: Modem abschalten
+//   1. AT+CPOWD=1 (SIM7028: meist ERROR)
+//   2. sonst langer Power-Key-Puls, danach pruefen ob das Modem schweigt
+//   3. antwortet es noch: AT+CFUN=1,1 (Modem-Reset), notfalls AT+CFUN=0
+static void modemPowerOff() {
+    modemActionMs = millis();
+    bool wasAlive = sendAT("AT","OK",T_SHORT);
+    bool off = false;
+    if (wasAlive) {
+        if (httpInitDone) sendAT("AT+HTTPTERM","OK",T_SHORT);
+        ts(); Serial.println("[MODEM] SIM7028 abschalten (AT+CPOWD=1)...");
+        off = sendAT("AT+CPOWD=1","NORMAL POWER DOWN",T_MEDIUM);
+    }
+    if (!off) {
+        ts(); Serial.print("[MODEM] Power-Key-Puls ");
+        Serial.print(MODEM_PWRKEY_OFF_MS); Serial.println("ms (Modem aus)");
+        pinMode(SIM_PWR_PIN, OUTPUT);
+        digitalWrite(SIM_PWR_PIN, HIGH);
+        waitMs(MODEM_PWRKEY_OFF_MS);
+        digitalWrite(SIM_PWR_PIN, LOW);
+        waitMs(3000);
+        while (simSerial.available()) simSerial.read();   // Abschalt-Meldungen verwerfen
+        off = !sendAT("AT","OK",T_SHORT);
+        if (off) {
+            logEvent("INFO", "Modem per Power-Key abgeschaltet (%s)",
+                     wasAlive ? "CPOWD nicht angenommen" : "Modem war stumm");
+        } else {
+            logEvent("WARN", "Modem nach Power-Key noch an - Reset per AT+CFUN=1,1");
+            if (!sendAT("AT+CFUN=1,1","OK",T_CFUN)) {
+                logEvent("ERR", "AT+CFUN=1,1 abgelehnt - nur Funkteil aus (AT+CFUN=0)");
+                sendAT("AT+CFUN=0","OK",T_CFUN);
+            }
         }
     }
+    httpInitDone = false;
+    cfunFull = false;
+    netRegistered = false;
+    regState = REG_NOT_STARTED;
+    modemActionMs = millis();
+}
 
-    if (millis() - lastModemAliveMs > HANG_RESTART_MS) {
-        hangRestart("Modem seit 5 Minuten ohne Antwort");
+// ══════════════════════════════════════════════════════════════════════════════
+// FIX 46/50: Modem-Lebenszeichen pruefen
+//   Modem 60s still -> "AT"; danach alle 20s; 3 Fehlversuche -> Komplett-Neustart
+// ══════════════════════════════════════════════════════════════════════════════
+static void checkModemAlive() {
+    static uint32_t lastPing = 0;
+    uint32_t now = millis();
+
+    if (now - lastModemAliveMs < MODEM_SILENT_PING_MS) { modemPingFails = 0; return; }
+    if (lastPing != 0 && now - lastPing < MODEM_PING_INTERVAL_MS) return;
+    lastPing = now;
+
+    if (sendAT("AT","OK",T_SHORT)) {
+        if (modemPingFails > 0) {
+            logEvent("INFO", "Modem antwortet wieder (nach %u Fehlversuchen)", modemPingFails);
+        }
+        modemPingFails = 0;
+        return;
+    }
+    modemPingFails++;
+    logEvent("WARN", "Modem antwortet nicht auf AT (%u/%u, stumm seit %lus)",
+             modemPingFails, MODEM_PING_FAIL_MAX,
+             (unsigned long)((millis() - lastModemAliveMs)/1000UL));
+    if (modemPingFails >= MODEM_PING_FAIL_MAX) {
+        hangRestart("Modem antwortet 3x nicht auf AT");
     }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// FIX 47: Taeglicher Neustart ATOM + SIM7028 mit 1 Min Pause
+// FIX 50: Modem hat sich selbst neu gestartet -> neu einrichten
 // ══════════════════════════════════════════════════════════════════════════════
-static void dailyRestart(const char *reason) {
-    dailyRestartCount++;
+static void handleModemReboot() {
+    if (!modemRebootDetected) return;
+    modemRebootDetected = false;
+    logEvent("WARN", "Modem hat sich selbst neu gestartet - wird neu eingerichtet");
+    modemActionMs = millis();
+    waitMs(2000);
+    sendAT("ATE0","OK",T_SHORT);
+    disableModemSleep();
+    setApn();
+    sendAT("AT+CEREG=1","OK",T_SHORT);
+    cfunFull = sendAT("AT+CFUN?","OK",T_SHORT) && strstr(rxBuf,"+CFUN: 1");
+    httpInitDone = false;
+    netRegistered = false;
+    regState = REG_NOT_STARTED;
+    startRegistrationIfNeeded();
+    modemActionMs = millis();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FIX 47/49/50: Kompletter Neustart ATOM + SIM7028
+//   kind = RESTART_KIND_CYCLE (geplant) oder RESTART_KIND_HANG (Stoerung)
+//   Schleifenschutz: ab dem 3. Stoerungs-Neustart ohne erfolgreiche
+//   Verbindung dazwischen -> 30 Min Pause statt 60s.
+// ══════════════════════════════════════════════════════════════════════════════
+static void fullRestart(uint8_t kind, const char *reason) {
+    const bool hang = (kind == RESTART_KIND_HANG);
+    uint64_t offS = CYCLE_RESTART_OFF_S;
+    if (hang) {
+        if (failedRestartsInRow < 255) failedRestartsInRow++;
+        if (failedRestartsInRow >= RESTART_LOOP_MAX) offS = RESTART_LOOP_OFF_S;
+    }
+    fullRestartCount++;
+    lastRestartKind = kind;
+    lastRestartOffS = (uint32_t)offS;
     Serial.println();
-    ts(); Serial.print("[DAILY] Neustart #"); Serial.print(dailyRestartCount);
+    ts(); Serial.print(hang ? "[HANG] " : "[CYCLE] ");
+    Serial.print("Kompletter Neustart #"); Serial.print(fullRestartCount);
     Serial.print(" ("); Serial.print(reason); Serial.println(")");
-    logEvent("INFO", "Tages-Neustart (%s) | Bilanz: HTTP ok=%lu fehl=%lu, SAPBR-ERROR=%lu",
+    logEvent(hang ? "ERR" : "INFO",
+             "%s (%s) | Bilanz: HTTP ok=%lu fehl=%lu, SAPBR-ERROR=%lu",
+             hang ? "Stoerungs-Neustart" : "Geplanter Neustart",
              reason, (unsigned long)statHttpOk, (unsigned long)statHttpFail,
              (unsigned long)statSapbrErr);
-    rtcEpochAfterSleep = timeValid ? (nowEpoch() + (uint32_t)DAILY_RESTART_OFF_S) : 0;
-
-    // 1. Offene HTTP-Session beenden
-    if (httpInitDone) { sendAT("AT+HTTPTERM","OK",T_SHORT); httpInitDone=false; }
-
-    // 2. Modem sauber abschalten
-    ts(); Serial.println("[DAILY] SIM7028 abschalten (AT+CPOWD=1)...");
-    if (!sendAT("AT+CPOWD=1","NORMAL POWER DOWN",T_MEDIUM)) {
-        ts(); Serial.println("[DAILY] kein NORMAL POWER DOWN - Fallback AT+CFUN=0");
-        sendAT("AT+CFUN=0","OK",T_CFUN);
+    if (offS != CYCLE_RESTART_OFF_S) {
+        logEvent("ERR", "%u Stoerungs-Neustarts in Folge ohne Verbindung -> %lu Min Pause",
+                 failedRestartsInRow, (unsigned long)(offS/60ULL));
     }
+    rtcEpochAfterSleep = timeValid ? (nowEpoch() + (uint32_t)offS) : 0;
+
+    // 1.+2. Modem abschalten (sauber oder per Power-Key)
+    modemPowerOff();
 
     // 3. Power-Key-Pin im Sleep fest auf LOW halten
     pinMode(SIM_PWR_PIN, OUTPUT);
@@ -1597,24 +1862,274 @@ static void dailyRestart(const char *reason) {
     gpio_hold_en((gpio_num_t)SIM_PWR_PIN);
     gpio_deep_sleep_hold_en();
 
-    // 4. ATOM fuer 60s ausschalten (Deep Sleep), danach Kaltstart
-    ts(); Serial.print("[DAILY] ATOM geht fuer ");
-    Serial.print((uint32_t)DAILY_RESTART_OFF_S);
+    // 4. ATOM ausschalten (Deep Sleep), danach Kaltstart
+    ts(); Serial.print("[RESTART] ATOM geht fuer ");
+    Serial.print((uint32_t)offS);
     Serial.println("s aus (Deep Sleep) - danach Neustart von ATOM + Modem.");
     Serial.flush(); extSerial.flush();
     led.setPixelColor(0, 0); led.show();
-    esp_sleep_enable_timer_wakeup(DAILY_RESTART_OFF_S * 1000000ULL);
+    esp_sleep_enable_timer_wakeup(offS * 1000000ULL);
     esp_deep_sleep_start();
 }
 
-static void checkDailyRestart() {
-    if (millis() < DAILY_RESTART_MS) return;
+// ══════════════════════════════════════════════════════════════════════════════
+// FIX 50: Gestufte Wiederherstellung
+// ══════════════════════════════════════════════════════════════════════════════
+static void runRecoveryStage(uint8_t level, const char *reason) {
+    if (level < 1) level = 1;
+    if (level > 4) level = 4;
+    recoveryLevel = level;
+    connFails = 0;
+    Serial.println();
+    ts(); Serial.print("[RECOVERY] === Stufe "); Serial.print(level);
+    Serial.print(" ("); Serial.print(reason); Serial.println(") ===");
+    logEvent(level >= 3 ? "ERR" : "WARN", "Wiederherstellung Stufe %u (%s)", level, reason);
+    ledYellow();
 
-    bool overdue = millis() > (DAILY_RESTART_MS + DAILY_RESTART_MAX_DELAY_MS);
-    bool idle    = (millis() - lastExtCmdMs > DAILY_RESTART_IDLE_MS) && !httpInitDone;
+    switch (level) {
+    case 1: {   // Verbindung neu aufbauen, Modem bleibt im Netz
+        if (httpInitDone) { sendAT("AT+HTTPTERM","OK",T_SHORT); httpInitDone=false; }
+        bool reg = false;
+        if (sendAT("AT+CEREG?","OK",T_SHORT)) {
+            int s = parseCeregStat(rxBuf);
+            reg = (s==1 || s==5);
+        }
+        if (!reg) {
+            ts(); Serial.println("[RECOVERY] Stufe 1: nicht registriert");
+            if (regState == REG_REGISTERED) {          // Zustand war veraltet
+                netRegistered = false;
+                regState = REG_NOT_STARTED;
+                startRegistrationIfNeeded();
+            }
+        } else if (!hasIpOnContext()) {
+            ts(); Serial.println("[RECOVERY] Stufe 1: keine IP - PDP aktivieren");
+            char actCmd[24];
+            snprintf(actCmd, sizeof(actCmd), "AT+CGACT=1,%d", PDP_CID);
+            sendAT(actCmd, "OK", 30000);
+        } else {
+            ts(); Serial.println("[RECOVERY] Stufe 1: registriert + IP vorhanden");
+        }
+        break;
+    }
+    case 2: {   // Funkteil neu starten, Neuanmeldung
+        if (httpInitDone) { sendAT("AT+HTTPTERM","OK",T_SHORT); httpInitDone=false; }
+        modemActionMs = millis();
+        sendAT("AT+CFUN=0","OK",T_CFUN);
+        waitMs(3000);
+        cfunFull = sendAT("AT+CFUN=1","OK",T_CFUN,500);
+        netRegistered = false;
+        regState = REG_NOT_STARTED;
+        startRegistrationIfNeeded();
+        modemActionMs = millis();
+        break;
+    }
+    case 3: {   // Nur Modem neu starten, ATOM laeuft weiter
+        modemPowerOff();
+        waitMs(5000);
+        ensureModemOn();
+        setApn();
+        sendAT("AT+CEREG=1","OK",T_SHORT);
+        startRegistrationIfNeeded();
+        lastModemAliveMs = millis();
+        modemPingFails = 0;
+        modemActionMs = millis();
+        break;
+    }
+    default: {  // 4: Komplett-Neustart ATOM + Modem
+        char why[96];
+        snprintf(why, sizeof(why), "Stufe 4: %s", reason);
+        hangRestart(why);
+        break;
+    }
+    }
+    ts(); Serial.print("[RECOVERY] Stufe "); Serial.print(level); Serial.println(" erledigt");
+}
 
-    if (idle)         dailyRestart("24h Betriebszeit erreicht");
-    else if (overdue) dailyRestart("24h + 2h - µC nie still, erzwungen");
+// ══════════════════════════════════════════════════════════════════════════════
+// FIX 53: Netzverlust (Mobilfunk-Umstellung, Zellwechsel, Detach vom Netz)
+// ══════════════════════════════════════════════════════════════════════════════
+static void onRegistrationLost(int stat, const char *source) {
+    if (regState != REG_REGISTERED) return;
+    logEvent("WARN", "Netz verloren (%s, CEREG stat=%d) - neu anmelden", source, stat);
+    netRegistered = false;
+    regState = REG_NOT_STARTED;   // Neuanmeldung startet im Leerlauf (checkRecovery)
+    regLostAtMs = millis();       // erst Gnadenfrist: Modem meldet sich oft selbst wieder an
+}
+
+// +CEREG-URC aus loop(): "+CEREG: <stat>[,...]"
+static void handleCeregUrc(const char *line) {
+    int stat = -1;
+    if (sscanf(line, "+CEREG: %d", &stat) != 1) return;
+    if (millis() - modemActionMs < MODEM_REBOOT_GUARD_MS) return;   // eigene Aktion
+    if (stat == 1 || stat == 5) {
+        if (regState == REG_NOT_STARTED || regState == REG_GAVE_UP) {
+            regState = REG_REGISTERED; netRegistered = true;
+            logEvent("INFO", "Netz wieder da (URC, stat=%d)", stat);
+            ledOff();
+        }
+    } else {
+        onRegistrationLost(stat, "URC");
+    }
+}
+
+static void checkRecovery() {
+    bool ucIdle = (millis() - lastExtCmdMs > RECOVERY_IDLE_MS) && !httpInitDone;
+
+    // FIX 53: Anmeldung, die nicht laeuft, im Leerlauf selbst starten
+    //         (nach Netzverlust erst nach 60s Gnadenfrist)
+    if (regState == REG_NOT_STARTED && ucIdle && recoveryPending == 0 &&
+        (regLostAtMs == 0 || millis() - regLostAtMs > REG_LOST_GRACE_MS)) {
+        regLostAtMs = 0;
+        if (sendAT("AT+CEREG?","OK",T_SHORT)) {
+            int s = parseCeregStat(rxBuf);
+            if (s == 1 || s == 5) {
+                regState = REG_REGISTERED; netRegistered = true;
+                logEvent("INFO", "Netz wieder da (Modem selbst angemeldet, stat=%d)", s);
+                return;
+            }
+        }
+        ts(); Serial.println("[NETREG] nicht registriert, Anmeldung laeuft nicht - starte");
+        startRegistrationIfNeeded();
+    }
+
+    // FIX 53: im Leerlauf alle 5 Min pruefen, ob das Modem noch registriert ist
+    static uint32_t lastRegCheck = 0;
+    if (regState == REG_REGISTERED && ucIdle &&
+        millis() - lastRegCheck > REG_CHECK_INTERVAL_MS) {
+        lastRegCheck = millis();
+        if (sendAT("AT+CEREG?","OK",T_SHORT)) {
+            int s = parseCeregStat(rxBuf);
+            if (s >= 0 && s != 1 && s != 5) onRegistrationLost(s, "Pruefung");
+        }
+    }
+
+    // FIX 53: je 30 Min ohne Netz -> naechste Stufe (mind. Stufe 2)
+    if (regState == REG_REGISTERED) {
+        noRegSinceMs = 0;
+    } else if (noRegSinceMs == 0) {
+        noRegSinceMs = millis() | 1;
+    } else if (millis() - noRegSinceMs > NOREG_ESCALATE_MS) {
+        noRegSinceMs = millis() | 1;
+        uint8_t lvl = recoveryLevel + 1;
+        if (lvl < 2) lvl = 2;
+        scheduleRecovery(lvl, "30 Min kein Netz");
+    }
+
+    if (recoveryPending == 0) return;
+    bool idle    = ucIdle;
+    bool overdue = millis() - recoveryPendingSince > RECOVERY_MAX_DELAY_MS;
+    if (!idle && !overdue) return;
+
+    uint8_t lvl = recoveryPending;
+    recoveryPending = 0;
+    char why[64];
+    snprintf(why, sizeof(why), "%s", recoveryReason);
+    runRecoveryStage(lvl, why);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FIX 54: Diagnose-Log (stuendliches Lebenszeichen, µC-Stille)
+// ══════════════════════════════════════════════════════════════════════════════
+static const char* regStateName() {
+    return (regState==REG_NOT_STARTED) ? "NICHT_GESTARTET" :
+           (regState==REG_SEARCHING)   ? "SUCHT" :
+           (regState==REG_REGISTERED)  ? "REGISTRIERT" :
+           (regState==REG_GAVE_UP)     ? "AUFGEGEBEN" : "?";
+}
+
+static void checkDiagnostics() {
+    // µC 15 Min ohne Befehl -> einmal warnen
+    if (!extSilentWarned && millis() - lastExtCmdMs > EXT_UC_SILENT_WARN_MS) {
+        extSilentWarned = true;
+        uint32_t bytesSince = extRxBytes - extRxBytesAtLastCmd;
+        logEvent("WARN", "µC seit %lu Min ohne Befehl (letzter: %.30s) - %lu Bytes seither empfangen%s",
+                 (unsigned long)((millis() - lastExtCmdMs)/60000UL), lastExtCmdText,
+                 (unsigned long)bytesSince,
+                 bytesSince ? " (Daten kommen an, aber kein gueltiger Befehl)" : " (Leitung still)");
+    }
+
+    // stuendliches Lebenszeichen
+    static uint32_t lastBeat = 0;
+    static uint32_t okAtLast = 0, failAtLast = 0, cmdAtLast = 0, bytesAtLast = 0;
+    if (millis() - lastBeat < LOG_HEARTBEAT_MS) return;
+    if (millis() - lastExtCmdMs < RECOVERY_IDLE_MS || httpInitDone) return;   // µC nicht stoeren
+    lastBeat = millis();
+    int rssi = readCsqRssi();
+    logEvent("INFO", "Lebenszeichen: HTTP ok=%lu fehl=%lu | µC %lu Befehle, %lu B, still seit %lus | Netz %s CSQ=%d | Stufe %u | Heap %lu",
+             (unsigned long)(statHttpOk - okAtLast), (unsigned long)(statHttpFail - failAtLast),
+             (unsigned long)(extCmdCount - cmdAtLast), (unsigned long)(extRxBytes - bytesAtLast),
+             (unsigned long)((millis() - lastExtCmdMs)/1000UL),
+             regStateName(), rssi, recoveryLevel, (unsigned long)ESP.getFreeHeap());
+    okAtLast = statHttpOk; failAtLast = statHttpFail;
+    cmdAtLast = extCmdCount; bytesAtLast = extRxBytes;
+}
+
+static void printRecoveryStatus() {
+    Serial.println("\n──────── STATUS (FIX 50) ────────");
+    Serial.printf("  Verbindungsfehler in Folge : %u / %u\n", connFails, CONN_FAIL_THRESHOLD);
+    Serial.printf("  Letzte Stufe / geplant     : %u / %u %s\n", recoveryLevel, recoveryPending,
+                  recoveryPending ? recoveryReason : "");
+    if (connOkSinceBoot)
+        Serial.printf("  Letzte erfolgreiche Verb.  : vor %lus\n",
+                      (unsigned long)((millis() - lastConnOkMs)/1000UL));
+    else
+        Serial.println("  Letzte erfolgreiche Verb.  : seit Start keine");
+    if (firstFailSinceOkMs)
+        Serial.printf("  Fehler seit                : %lus (Stufe 4 nach %lus)\n",
+                      (unsigned long)((millis() - firstFailSinceOkMs)/1000UL),
+                      (unsigned long)(CONN_NO_SUCCESS_MAX_MS/1000UL));
+    Serial.printf("  Stoerungs-Neustarts i.Folge: %u (Pause 30 Min ab %u)\n",
+                  failedRestartsInRow, RESTART_LOOP_MAX);
+    Serial.printf("  Modem stumm / AT-Fehler    : %lus / %u\n",
+                  (unsigned long)((millis() - lastModemAliveMs)/1000UL), modemPingFails);
+    Serial.printf("  Heap frei / groesster Block: %lu / %lu B\n",
+                  (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
+    Serial.printf("  Netz                       : %s%s\n", regStateName(),
+                  noRegSinceMs ? " (ohne Netz, Eskalation alle 30 Min)" : "");
+    Serial.printf("  µC: Befehle / Bytes / still: %lu / %lu / %lus (letzter: %s)\n",
+                  (unsigned long)extCmdCount, (unsigned long)extRxBytes,
+                  (unsigned long)((millis() - lastExtCmdMs)/1000UL), lastExtCmdText);
+    Serial.printf("  Netzzeit                   : %s\n", timeValid ? "ok" : "noch keine");
+    Serial.printf("  Geplanter Neustart in      : %lu Min\n",
+                  millis() < CYCLE_RESTART_MS ? (unsigned long)((CYCLE_RESTART_MS - millis())/60000UL) : 0UL);
+    Serial.println("─────────────────────────────────\n");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FIX 47/50: Geplanter Neustart (24h-Sicherheitsnetz oder Speicher knapp)
+// ══════════════════════════════════════════════════════════════════════════════
+static void checkCycleRestart() {
+    static uint32_t lastHeapCheck = 0;
+    if (heapLowSinceMs == 0 && millis() - lastHeapCheck > HEAP_CHECK_INTERVAL_MS) {
+        lastHeapCheck = millis();
+        uint32_t freeH = ESP.getFreeHeap(), maxBlk = ESP.getMaxAllocHeap();
+        if (freeH < HEAP_MIN_FREE || maxBlk < HEAP_MIN_BLOCK) {
+            heapLowSinceMs = millis() | 1;
+            logEvent("WARN", "Speicher knapp: frei=%lu B, groesster Block=%lu B -> Neustart geplant",
+                     (unsigned long)freeH, (unsigned long)maxBlk);
+        }
+    }
+
+    const char *reason;
+    uint32_t dueSince;
+    if (heapLowSinceMs != 0) {
+        reason = "Speicher knapp"; dueSince = heapLowSinceMs;
+    } else if (millis() >= CYCLE_RESTART_MS) {
+        reason = "24h Betriebszeit erreicht"; dueSince = CYCLE_RESTART_MS;
+    } else {
+        return;
+    }
+
+    bool idle    = (millis() - lastExtCmdMs > CYCLE_RESTART_IDLE_MS) && !httpInitDone;
+    bool overdue = millis() - dueSince > CYCLE_RESTART_MAX_DELAY_MS;
+
+    if (idle) {
+        fullRestart(RESTART_KIND_CYCLE, reason);
+    } else if (overdue) {
+        char why[64];
+        snprintf(why, sizeof(why), "%s, µC nie still - erzwungen", reason);
+        fullRestart(RESTART_KIND_CYCLE, why);
+    }
     // sonst: µC gerade aktiv -> beim naechsten loop()-Durchlauf erneut pruefen
 }
 
@@ -1626,6 +2141,7 @@ static void syncTimeFromModem() {
     const char *p = strstr(rxBuf, "+CCLK:");
     int yy, mo, dd, hh, mi, ss;
     if (!p || sscanf(p, "+CCLK: \"%d/%d/%d,%d:%d:%d", &yy,&mo,&dd,&hh,&mi,&ss) != 6) return;
+    if (yy >= 2000) yy -= 2000;   // FIX 51: SIM7028 liefert 4-stelliges Jahr
     if (yy < 24 || yy > 99 || mo < 1 || mo > 12 || dd < 1 || dd > 31) {
         ts(); Serial.println("[TIME] Modem hat (noch) keine gueltige Netzzeit");
         return;
@@ -1658,7 +2174,7 @@ static const char* resetReasonName(esp_reset_reason_t r) {
         case ESP_RST_SW:        return "Software-Reset (z.B. ESP.restart() / Haenger-Neustart)";
         case ESP_RST_PANIC:     return "Software-PANIC (Crash/Exception oder Task-WDT)";
         case ESP_RST_INT_WDT:   return "interner Watchdog (Task/Interrupt)";
-        case ESP_RST_TASK_WDT:  return "Task-Watchdog-Timeout (5-Min-Haenger)";
+        case ESP_RST_TASK_WDT:  return "Task-Watchdog-Timeout (2-Min-Haenger)";
         case ESP_RST_WDT:       return "sonstiger Watchdog";
         case ESP_RST_DEEPSLEEP: return "Aufwachen aus Deep Sleep";
         case ESP_RST_BROWNOUT:  return "⚠ BROWNOUT (Spannungseinbruch!) ⚠";
@@ -1703,10 +2219,11 @@ void setup() {
     Serial.printf( "║  SIM800→SIM7028 Bridge %s (%s)   ║\n", FW_VERSION, FW_DATE);
     Serial.println("║  SIM: RX=G6 TX=G5  |  EXT: TX=G38 RX=G39   ║");
     Serial.println("║  PDP-Kontext 0 | 1NCE No-Harm Backoff        ║");
-    Serial.println("║  Kein Sleep | Haenger-Neustart nach 5 Min    ║");
-    Serial.println("║  Taeglicher Neustart ATOM+SIM (1 Min Pause)  ║");
+    Serial.println("║  Kein Sleep | Stoerungserkennung, 4 Stufen   ║");
+    Serial.println("║  Sicherheits-Neustart ATOM+SIM alle 24h      ║");
     Serial.println("║  Fehler-Log im Flash (LOG / LOGCLR)          ║");
-    Serial.println("║  USB: REG|DIAG|SCAN|RESTART|DAILY|LOG|AT+... ║");
+    Serial.println("║  USB: REG|DIAG|SCAN|STATUS|REC1-3|RESTART|   ║");
+    Serial.println("║       CYCLE|LOG|LOGCLR|AT+...                ║");
     Serial.println("╚══════════════════════════════════════════════╝");
 
     esp_reset_reason_t rr = esp_reset_reason();
@@ -1714,8 +2231,12 @@ void setup() {
     Serial.print(resetReasonName(rr));
     Serial.print("  (Rohwert: "); Serial.print((int)rr); Serial.println(")");
     if (rr == ESP_RST_DEEPSLEEP) {
-        ts(); Serial.print("[BOOT] -> Taeglicher Neustart #");
-        Serial.print(dailyRestartCount); Serial.println(" abgeschlossen (nach 1 Min Pause)");
+        ts(); Serial.print("[BOOT] -> ");
+        Serial.print(lastRestartKind == RESTART_KIND_HANG ? "Stoerungs-Neustart #"
+                                                          : "Geplanter Neustart #");
+        Serial.print(fullRestartCount); Serial.print(" abgeschlossen (nach ");
+        Serial.print(lastRestartOffS); Serial.print("s Pause, Stoerungs-Neustarts in Folge: ");
+        Serial.print(failedRestartsInRow); Serial.println(")");
     }
     // FIX 48: Flash-Log starten, Zeit ueber Deep Sleep retten, Boot loggen
     logInit();
@@ -1731,10 +2252,17 @@ void setup() {
         logEvent(bad ? "ERR" : "BOOT", "Start %s, Reset-Grund: %s",
                  FW_VERSION, resetReasonName(rr));
     }
+    // FIX 49: Nach Watchdog/Crash lief das Modem einfach weiter -> jetzt auch
+    // das Modem komplett neu starten (Modem aus, 60s Pause, Kaltstart).
+    if (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT ||
+        rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT) {
+        hangRestart("nach Watchdog-/Panic-Reset");
+    }
     ts(); Serial.print("[BOOT] Freier Heap: ");
     Serial.print(ESP.getFreeHeap()); Serial.println(" Bytes");
 
     lastModemAliveMs = millis();
+    modemActionMs = millis();
     ensureModemOn();
     setApn();
     sendAT("AT+CEREG=1","OK",T_SHORT);
@@ -1751,6 +2279,7 @@ void setup() {
                          Serial.print(flushed); Serial.println(" Bytes verworfen"); }
     }
     lastDataLen=0; bodyLen=0; rawHttpReadLen=0;
+    modemActionMs = millis();   // FIX 50: Boot-URCs nicht als Modem-Neustart werten
 
     ledOff(); ledSet(0,80,0,500);
     ts(); Serial.println("[OK] Bridge " FW_VERSION " bereit\n");
@@ -1771,6 +2300,13 @@ void loop() {
                     ts(); Serial.print("[←SIM URC] ");
                     printEscaped(urcBuf, urcIdx);
                     Serial.println();
+                    // FIX 50: Modem-Selbstneustart erkennen (nicht nach eigener Aktion)
+                    if ((strncmp(urcBuf, "RDY", 3) == 0 || strstr(urcBuf, "+CPIN: READY")) &&
+                        millis() - modemActionMs > MODEM_REBOOT_GUARD_MS) {
+                        modemRebootDetected = true;
+                    }
+                    // FIX 53: Netzverlust/-rueckkehr per URC
+                    if (strncmp(urcBuf, "+CEREG:", 7) == 0) handleCeregUrc(urcBuf);
                 }
                 urcIdx = 0;
             }
@@ -1782,8 +2318,11 @@ void loop() {
     readExtSerial();
     readUsbSerial();
     pollRegistrationBackground();
-    checkModemAlive();      // FIX 46
-    checkDailyRestart();    // FIX 47
+    handleModemReboot();    // FIX 50
+    checkModemAlive();      // FIX 46/50
+    checkRecovery();        // FIX 50/53
+    checkDiagnostics();     // FIX 54
+    checkCycleRestart();    // FIX 47/50
     maybeSyncTime();        // FIX 48
 
     static uint32_t lastHeartbeat = 0;
@@ -1805,10 +2344,14 @@ void loop() {
             Serial.print(" naechsterRetrigger=in "); Serial.print(remain/1000); Serial.print("s");
         }
         Serial.print(" modemStumm="); Serial.print((millis()-lastModemAliveMs)/1000); Serial.print("s");
-        Serial.print(" dailyRestartIn=");
-        Serial.print(millis() < DAILY_RESTART_MS ? (DAILY_RESTART_MS - millis())/60000UL : 0);
+        Serial.print(" connFails="); Serial.print(connFails);
+        Serial.print(" stufe="); Serial.print(recoveryLevel);
+        if (recoveryPending) { Serial.print(" geplant="); Serial.print(recoveryPending); }
+        Serial.print(" cycleRestartIn=");
+        Serial.print(millis() < CYCLE_RESTART_MS ? (CYCLE_RESTART_MS - millis())/60000UL : 0);
         Serial.print("min");
-        Serial.print(" heap="); Serial.print(ESP.getFreeHeap()); Serial.println("B");
+        Serial.print(" heap="); Serial.print(ESP.getFreeHeap());
+        Serial.print("B maxBlk="); Serial.print(ESP.getMaxAllocHeap()); Serial.println("B");
     }
 
     yield();
